@@ -26,7 +26,10 @@ package hudson.model;
 
 import hudson.Extension;
 import hudson.Util;
+import hudson.model.Queue.Executable;
 import hudson.model.Queue.WaitingItem;
+import hudson.model.queue.QueueTaskFuture;
+
 import java.io.IOException;
 import java.util.AbstractList;
 import java.util.ArrayList;
@@ -34,8 +37,12 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+
 import javax.annotation.CheckForNull;
 import javax.servlet.ServletException;
+import javax.servlet.ServletOutputStream;
+
 import static javax.servlet.http.HttpServletResponse.SC_CREATED;
 import jenkins.model.Jenkins;
 import jenkins.model.ParameterizedJobMixIn;
@@ -52,199 +59,292 @@ import org.kohsuke.stapler.export.ExportedBean;
 
 /**
  * Keeps a list of the parameters defined for a project.
- *
+ * 
  * <p>
- * This class also implements {@link Action} so that <tt>index.jelly</tt> provides
- * a form to enter build parameters.
- * <p>The owning job needs a {@code sidepanel.jelly} and should have web methods delegating to {@link ParameterizedJobMixIn#doBuild} and {@link ParameterizedJobMixIn#doBuildWithParameters}.
- * The builds also need a {@code sidepanel.jelly}.
+ * This class also implements {@link Action} so that <tt>index.jelly</tt>
+ * provides a form to enter build parameters.
+ * <p>
+ * The owning job needs a {@code sidepanel.jelly} and should have web methods
+ * delegating to {@link ParameterizedJobMixIn#doBuild} and
+ * {@link ParameterizedJobMixIn#doBuildWithParameters}. The builds also need a
+ * {@code sidepanel.jelly}.
  */
-@ExportedBean(defaultVisibility=2)
+@ExportedBean(defaultVisibility = 2)
 public class ParametersDefinitionProperty extends JobProperty<Job<?, ?>>
-        implements Action {
+    implements Action {
 
-    private final List<ParameterDefinition> parameterDefinitions;
+  private static final String TEST_RESULT_FOR_RETURN_SUCCESS_VALUE = "Pass";
+  private static final String TEST_RESULT_FOR_RETURN_NOT_SUCCESS_VALUE = "Fail";
+  private final List<ParameterDefinition> parameterDefinitions;
 
-    public ParametersDefinitionProperty(List<ParameterDefinition> parameterDefinitions) {
-        this.parameterDefinitions = parameterDefinitions;
+  public ParametersDefinitionProperty(
+      List<ParameterDefinition> parameterDefinitions) {
+    this.parameterDefinitions = parameterDefinitions;
+  }
+
+  public ParametersDefinitionProperty(
+      ParameterDefinition... parameterDefinitions) {
+    this.parameterDefinitions = Arrays.asList(parameterDefinitions);
+  }
+
+  @Deprecated
+  public AbstractProject<?, ?> getOwner() {
+    return (AbstractProject) owner;
+  }
+
+  @Restricted(NoExternalUse.class)
+  // Jelly
+  public ParameterizedJobMixIn.ParameterizedJob getJob() {
+    return (ParameterizedJobMixIn.ParameterizedJob) owner;
+  }
+
+  @Exported
+  public List<ParameterDefinition> getParameterDefinitions() {
+    return parameterDefinitions;
+  }
+
+  /**
+   * Gets the names of all the parameter definitions.
+   */
+  public List<String> getParameterDefinitionNames() {
+    return new AbstractList<String>() {
+      public String get(int index) {
+        return parameterDefinitions.get(index).getName();
+      }
+
+      public int size() {
+        return parameterDefinitions.size();
+      }
+    };
+  }
+
+  @Override
+  public Collection<Action> getJobActions(Job<?, ?> job) {
+    return Collections.<Action> singleton(this);
+  }
+
+  @Deprecated
+  public Collection<Action> getJobActions(AbstractProject<?, ?> job) {
+    return getJobActions((Job) job);
+  }
+
+  @Deprecated
+  public AbstractProject<?, ?> getProject() {
+    return (AbstractProject<?, ?>) owner;
+  }
+
+  /**
+   * @deprecated use
+   *             {@link #_doBuild(StaplerRequest, StaplerResponse, TimeDuration)}
+   */
+  @Deprecated
+  public void _doBuild(StaplerRequest req, StaplerResponse rsp)
+      throws IOException, ServletException {
+    _doBuild(req, rsp, TimeDuration.fromString(req.getParameter("delay")));
+  }
+
+  /**
+   * Interprets the form submission and schedules a build for a parameterized
+   * job.
+   * 
+   * <p>
+   * This method is supposed to be invoked from
+   * {@link ParameterizedJobMixIn#doBuild(StaplerRequest, StaplerResponse, TimeDuration)}.
+   */
+  public void _doBuild(StaplerRequest req, StaplerResponse rsp,
+      @QueryParameter TimeDuration delay) throws IOException, ServletException {
+    if (delay == null)
+      delay = new TimeDuration(getJob().getQuietPeriod());
+
+    List<ParameterValue> values = new ArrayList<ParameterValue>();
+
+    JSONObject formData = req.getSubmittedForm();
+    JSONArray a = JSONArray.fromObject(formData.get("parameter"));
+
+    for (Object o : a) {
+      JSONObject jo = (JSONObject) o;
+      String name = jo.getString("name");
+
+      ParameterDefinition d = getParameterDefinition(name);
+      if (d == null)
+        throw new IllegalArgumentException("No such parameter definition: "
+            + name);
+      ParameterValue parameterValue = d.createValue(req, jo);
+      if (parameterValue != null) {
+        values.add(parameterValue);
+      } else {
+        throw new IllegalArgumentException(
+            "Cannot retrieve the parameter value: " + name);
+      }
     }
 
-    public ParametersDefinitionProperty(ParameterDefinition... parameterDefinitions) {
-        this.parameterDefinitions = Arrays.asList(parameterDefinitions);
-    }
+    WaitingItem item = Jenkins
+        .getInstance()
+        .getQueue()
+        .schedule(getJob(), delay.getTime(), new ParametersAction(values),
+            new CauseAction(new Cause.UserIdCause()));
+    if (item != null) {
+      String url = formData.optString("redirectTo");
+      if (url == null || Util.isAbsoluteUri(url)) // avoid open redirect
+        url = req.getContextPath() + '/' + item.getUrl();
+      rsp.sendRedirect(formData.optInt("statusCode", SC_CREATED), url);
+    } else
+      // send the user back to the job top page.
+      rsp.sendRedirect(".");
+  }
 
-    @Deprecated
-    public AbstractProject<?,?> getOwner() {
-        return (AbstractProject) owner;
-    }
+  /**
+   * @deprecated use
+   *             {@link #buildWithParameters(StaplerRequest, StaplerResponse, TimeDuration)}
+   */
+  @Deprecated
+  public void buildWithParameters(StaplerRequest req, StaplerResponse rsp)
+      throws IOException, ServletException {
+    buildWithParameters(req, rsp,
+        TimeDuration.fromString(req.getParameter("delay")));
+  }
 
-    @Restricted(NoExternalUse.class) // Jelly
-    public ParameterizedJobMixIn.ParameterizedJob getJob() {
-        return (ParameterizedJobMixIn.ParameterizedJob) owner;
+  public void buildWithParameters(StaplerRequest req, StaplerResponse rsp,
+      @CheckForNull TimeDuration delay) throws IOException, ServletException {
+    List<ParameterValue> values = new ArrayList<ParameterValue>();
+    for (ParameterDefinition d : parameterDefinitions) {
+      ParameterValue value = d.createValue(req);
+      if (value != null) {
+        values.add(value);
+      }
     }
+    if (delay == null)
+      delay = new TimeDuration(getJob().getQuietPeriod());
 
-    @Exported
-    public List<ParameterDefinition> getParameterDefinitions() {
-        return parameterDefinitions;
-    }
+    final long currentTimeMillis = System.currentTimeMillis();
 
-    /**
-     * Gets the names of all the parameter definitions.
-     */
-    public List<String> getParameterDefinitionNames() {
-        return new AbstractList<String>() {
-            public String get(int index) {
-                return parameterDefinitions.get(index).getName();
+    Queue.Item item = Jenkins
+        .getInstance()
+        .getQueue()
+        .schedule2(getJob(), delay.getTime(), new ParametersAction(values),
+            ParameterizedJobMixIn.getBuildCause(getJob(), req)).getItem();
+
+    if (item != null) {
+      String myTestResultForReturn = TEST_RESULT_FOR_RETURN_NOT_SUCCESS_VALUE;
+      String myTestExecutionMessage = "";
+      try {
+        Executable myTestRunExecution = item.getFuture().getStartCondition()
+            .get();
+        if (myTestRunExecution instanceof Run) {
+          @SuppressWarnings("rawtypes")
+          Run myRun = (Run) myTestRunExecution;
+          boolean myRunIsDone = false;
+          do {
+            final int myExecutionStateCheckWaitTime = 500;
+            if (myRun.isInProgress()) {
+              Thread.sleep(myExecutionStateCheckWaitTime);
+            } else {
+              if (myRun.isBuilding()) {
+                Thread.sleep(myExecutionStateCheckWaitTime);
+              } else {
+                final Result myTestResult = myRun.result;
+                if (Result.SUCCESS.equals(myTestResult)) {
+                  myTestResultForReturn = TEST_RESULT_FOR_RETURN_SUCCESS_VALUE;
+                } else {
+                  if (Result.ABORTED.equals(myTestResult)) {
+                    myTestExecutionMessage = "Test run was aborted.";
+                  } else {
+                    if (Result.FAILURE.equals(myTestResult)) {
+                      myTestExecutionMessage = "Test failed!";
+                    } else {
+                      if (Result.NOT_BUILT.equals(myTestResult)) {
+                        myTestExecutionMessage = "Test run was not executed.";
+                      } else {
+                        if (Result.UNSTABLE.equals(myTestResult)) {
+                          myTestExecutionMessage = "Test was unstable!";
+                        } else {
+                          myTestExecutionMessage = "Unknown test result status! Result was: "
+                              + myTestResult;
+                        }
+                      }
+                    }
+                  }
+                }
+                myRunIsDone = true;
+              }
             }
+          } while (!myRunIsDone);
+        }
+      } catch (InterruptedException e) {
+        myTestExecutionMessage="InterruptedException was thrown. Message: "+e.getMessage();
+      } catch (ExecutionException e) {
+        myTestExecutionMessage="ExecutionException was thrown. Message: "+e.getMessage();
+      } finally {
+        ServletOutputStream myServletOutputStream = rsp.getOutputStream();
+        myServletOutputStream.println("{");
+        myServletOutputStream.println("\t\"Result\": \"" + myTestResultForReturn
+            + "\",");
+        myServletOutputStream.println("\t\"Message\": \""
+            + myTestExecutionMessage + "\"");
+        myServletOutputStream.println("}");
+        myServletOutputStream.flush();
+        myServletOutputStream.close();
+      }
+    } else {
+      rsp.sendRedirect(".");
+    }
+  }
 
-            public int size() {
-                return parameterDefinitions.size();
-            }
-        };
+  /**
+   * Gets the {@link ParameterDefinition} of the given name, if any.
+   */
+  public ParameterDefinition getParameterDefinition(String name) {
+    for (ParameterDefinition pd : parameterDefinitions)
+      if (pd.getName().equals(name))
+        return pd;
+    return null;
+  }
+
+  @Extension
+  public static class DescriptorImpl extends JobPropertyDescriptor {
+    @Override
+    public boolean isApplicable(Class<? extends Job> jobType) {
+      return ParameterizedJobMixIn.ParameterizedJob.class
+          .isAssignableFrom(jobType);
     }
 
     @Override
-    public Collection<Action> getJobActions(Job<?, ?> job) {
-        return Collections.<Action>singleton(this);
-    }
-
-    @Deprecated
-    public Collection<Action> getJobActions(AbstractProject<?, ?> job) {
-        return getJobActions((Job) job);
-    }
-
-    @Deprecated
-    public AbstractProject<?, ?> getProject() {
-        return (AbstractProject<?, ?>) owner;
-    }
-
-    /** @deprecated use {@link #_doBuild(StaplerRequest, StaplerResponse, TimeDuration)} */
-    @Deprecated
-    public void _doBuild(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
-        _doBuild(req, rsp, TimeDuration.fromString(req.getParameter("delay")));
-    }
-
-    /**
-     * Interprets the form submission and schedules a build for a parameterized job.
-     *
-     * <p>
-     * This method is supposed to be invoked from {@link ParameterizedJobMixIn#doBuild(StaplerRequest, StaplerResponse, TimeDuration)}.
-     */
-    public void _doBuild(StaplerRequest req, StaplerResponse rsp, @QueryParameter TimeDuration delay) throws IOException, ServletException {
-        if (delay==null)    delay=new TimeDuration(getJob().getQuietPeriod());
-
-
-        List<ParameterValue> values = new ArrayList<ParameterValue>();
-        
-        JSONObject formData = req.getSubmittedForm();
-        JSONArray a = JSONArray.fromObject(formData.get("parameter"));
-
-        for (Object o : a) {
-            JSONObject jo = (JSONObject) o;
-            String name = jo.getString("name");
-
-            ParameterDefinition d = getParameterDefinition(name);
-            if(d==null)
-                throw new IllegalArgumentException("No such parameter definition: " + name);
-            ParameterValue parameterValue = d.createValue(req, jo);
-            if (parameterValue != null) {
-                values.add(parameterValue);
-            } else {
-                throw new IllegalArgumentException("Cannot retrieve the parameter value: " + name);
-            }
-        }
-
-    	WaitingItem item = Jenkins.getInstance().getQueue().schedule(
-                getJob(), delay.getTime(), new ParametersAction(values), new CauseAction(new Cause.UserIdCause()));
-        if (item!=null) {
-            String url = formData.optString("redirectTo");
-            if (url==null || Util.isAbsoluteUri(url))   // avoid open redirect
-                url = req.getContextPath()+'/'+item.getUrl();
-            rsp.sendRedirect(formData.optInt("statusCode",SC_CREATED), url);
-        } else
-            // send the user back to the job top page.
-            rsp.sendRedirect(".");
-    }
-
-    /** @deprecated use {@link #buildWithParameters(StaplerRequest, StaplerResponse, TimeDuration)} */
-    @Deprecated
-    public void buildWithParameters(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
-        buildWithParameters(req,rsp,TimeDuration.fromString(req.getParameter("delay")));
-    }
-
-    public void buildWithParameters(StaplerRequest req, StaplerResponse rsp, @CheckForNull TimeDuration delay) throws IOException, ServletException {
-        List<ParameterValue> values = new ArrayList<ParameterValue>();
-        for (ParameterDefinition d: parameterDefinitions) {
-        	ParameterValue value = d.createValue(req);
-        	if (value != null) {
-        		values.add(value);
-        	}
-        }
-        if (delay==null)    delay=new TimeDuration(getJob().getQuietPeriod());
-
-        Queue.Item item = Jenkins.getInstance().getQueue().schedule2(
-                getJob(), delay.getTime(), new ParametersAction(values), ParameterizedJobMixIn.getBuildCause(getJob(), req)).getItem();
-
-        if (item != null) {
-            rsp.sendRedirect(SC_CREATED, req.getContextPath() + '/' + item.getUrl());
-        } else {
-            rsp.sendRedirect(".");
-        }
-    }
-
-    /**
-     * Gets the {@link ParameterDefinition} of the given name, if any.
-     */
-    public ParameterDefinition getParameterDefinition(String name) {
-        for (ParameterDefinition pd : parameterDefinitions)
-            if (pd.getName().equals(name))
-                return pd;
+    public JobProperty<?> newInstance(StaplerRequest req, JSONObject formData)
+        throws FormException {
+      if (formData.isNullObject()) {
         return null;
+      }
+
+      JSONObject parameterized = formData.getJSONObject("parameterized");
+
+      if (parameterized.isNullObject()) {
+        return null;
+      }
+
+      List<ParameterDefinition> parameterDefinitions = Descriptor
+          .newInstancesFromHeteroList(req, parameterized, "parameter",
+              ParameterDefinition.all());
+      if (parameterDefinitions.isEmpty())
+        return null;
+
+      return new ParametersDefinitionProperty(parameterDefinitions);
     }
 
-    @Extension
-    public static class DescriptorImpl extends JobPropertyDescriptor {
-        @Override
-        public boolean isApplicable(Class<? extends Job> jobType) {
-            return ParameterizedJobMixIn.ParameterizedJob.class.isAssignableFrom(jobType);
-        }
-
-        @Override
-        public JobProperty<?> newInstance(StaplerRequest req,
-                                          JSONObject formData) throws FormException {
-            if (formData.isNullObject()) {
-                return null;
-            }
-
-            JSONObject parameterized = formData.getJSONObject("parameterized");
-
-            if (parameterized.isNullObject()) {
-            	return null;
-            }
-            
-            List<ParameterDefinition> parameterDefinitions = Descriptor.newInstancesFromHeteroList(
-                    req, parameterized, "parameter", ParameterDefinition.all());
-            if(parameterDefinitions.isEmpty())
-                return null;
-
-            return new ParametersDefinitionProperty(parameterDefinitions);
-        }
-
-        @Override
-        public String getDisplayName() {
-            return Messages.ParametersDefinitionProperty_DisplayName();
-        }
-    }
-
+    @Override
     public String getDisplayName() {
-        return null;
+      return Messages.ParametersDefinitionProperty_DisplayName();
     }
+  }
 
-    public String getIconFileName() {
-        return null;
-    }
+  public String getDisplayName() {
+    return null;
+  }
 
-    public String getUrlName() {
-        return null;
-    }
+  public String getIconFileName() {
+    return null;
+  }
+
+  public String getUrlName() {
+    return null;
+  }
 }
