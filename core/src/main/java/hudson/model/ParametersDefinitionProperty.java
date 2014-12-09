@@ -227,12 +227,14 @@ public class ParametersDefinitionProperty extends JobProperty<Job<?, ?>>
     if (item != null) {
       String myTestResultForReturn = TEST_RESULT_FOR_RETURN_NOT_SUCCESS_VALUE;
       String myTestExecutionMessage = "";
+      String myAbsoluteUrl = "";
       try {
         Executable myTestRunExecution = item.getFuture().getStartCondition()
             .get();
         if (myTestRunExecution instanceof Run) {
           @SuppressWarnings("rawtypes")
           Run myRun = (Run) myTestRunExecution;
+          myAbsoluteUrl = myRun.getAbsoluteUrl();
           boolean myRunIsDone = false;
           do {
             final int myExecutionStateCheckWaitTime = 500;
@@ -281,6 +283,8 @@ public class ParametersDefinitionProperty extends JobProperty<Job<?, ?>>
             + "\",");
         myServletOutputStream.println("\t\"Message\": \""
             + myTestExecutionMessage + "\"");
+        myServletOutputStream.println("\t\"Url\": \""
+            + myAbsoluteUrl + "\"");
         myServletOutputStream.println("}");
         myServletOutputStream.flush();
         myServletOutputStream.close();
