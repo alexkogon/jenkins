@@ -282,7 +282,7 @@ public class ParametersDefinitionProperty extends JobProperty<Job<?, ?>>
         myServletOutputStream.println("\t\"Result\": \"" + myTestResultForReturn
             + "\",");
         myServletOutputStream.println("\t\"Message\": \""
-            + myTestExecutionMessage + "\"");
+            + myTestExecutionMessage + "\",");
         myServletOutputStream.println("\t\"Url\": \""
             + myAbsoluteUrl + "\"");
         myServletOutputStream.println("}");
