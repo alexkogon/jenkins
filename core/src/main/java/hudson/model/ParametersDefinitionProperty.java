@@ -73,6 +73,8 @@ import org.kohsuke.stapler.export.ExportedBean;
 public class ParametersDefinitionProperty extends JobProperty<Job<?, ?>>
     implements Action {
 
+  private static final String LOG_EXTRACTION_POSTFIX_TESTS_RUN = "Tests run:";
+  private static final String LOG_EXTRACTION_PREFIX_FAILED_TESTS = "Failed tests:";
   private static final String TEST_RESULT_FOR_RETURN_SUCCESS_VALUE = "Pass";
   private static final String TEST_RESULT_FOR_RETURN_NOT_SUCCESS_VALUE = "Fail";
   private final List<ParameterDefinition> parameterDefinitions;
@@ -228,6 +230,7 @@ public class ParametersDefinitionProperty extends JobProperty<Job<?, ?>>
       String myTestResultForReturn = TEST_RESULT_FOR_RETURN_NOT_SUCCESS_VALUE;
       String myTestExecutionMessage = "";
       String myAbsoluteUrl = "";
+      String myLog = "";
       try {
         Executable myTestRunExecution = item.getFuture().getStartCondition()
             .get();
@@ -248,20 +251,28 @@ public class ParametersDefinitionProperty extends JobProperty<Job<?, ?>>
                 if (Result.SUCCESS.equals(myTestResult)) {
                   myTestResultForReturn = TEST_RESULT_FOR_RETURN_SUCCESS_VALUE;
                 } else {
-                  if (Result.ABORTED.equals(myTestResult)) {
-                    myTestExecutionMessage = "Test run was aborted.";
-                  } else {
-                    if (Result.FAILURE.equals(myTestResult)) {
-                      myTestExecutionMessage = "Test failed!";
+                  try {
+                    myLog = myRun.getLog();
+                    final int myFailedTestsIndex = myLog.lastIndexOf(LOG_EXTRACTION_PREFIX_FAILED_TESTS);
+                    final String myLogFromFailedTests = myLog.substring(myFailedTestsIndex+LOG_EXTRACTION_PREFIX_FAILED_TESTS.length());
+                    final int myTestsRunIndex = myLogFromFailedTests.indexOf(LOG_EXTRACTION_POSTFIX_TESTS_RUN);
+                    myTestExecutionMessage = myLogFromFailedTests.substring(0, myTestsRunIndex).trim();
+                  } catch (Exception e) {
+                    if (Result.ABORTED.equals(myTestResult)) {
+                      myTestExecutionMessage = "Test run was aborted.";
                     } else {
-                      if (Result.NOT_BUILT.equals(myTestResult)) {
-                        myTestExecutionMessage = "Test run was not executed.";
+                      if (Result.FAILURE.equals(myTestResult)) {
+                        myTestExecutionMessage = "Test failed!";
                       } else {
-                        if (Result.UNSTABLE.equals(myTestResult)) {
-                          myTestExecutionMessage = "Test was unstable!";
+                        if (Result.NOT_BUILT.equals(myTestResult)) {
+                          myTestExecutionMessage = "Test run was not executed.";
                         } else {
-                          myTestExecutionMessage = "Unknown test result status! Result was: "
-                              + myTestResult;
+                          if (Result.UNSTABLE.equals(myTestResult)) {
+                            myTestExecutionMessage = "Test was unstable!";
+                          } else {
+                            myTestExecutionMessage = "Unknown test result status! Result was: "
+                                + myTestResult;
+                          }
                         }
                       }
                     }
