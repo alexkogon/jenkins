@@ -256,7 +256,7 @@ public class ParametersDefinitionProperty extends JobProperty<Job<?, ?>>
                     final int myFailedTestsIndex = myLog.lastIndexOf(LOG_EXTRACTION_PREFIX_FAILED_TESTS);
                     final String myLogFromFailedTests = myLog.substring(myFailedTestsIndex+LOG_EXTRACTION_PREFIX_FAILED_TESTS.length());
                     final int myTestsRunIndex = myLogFromFailedTests.indexOf(LOG_EXTRACTION_POSTFIX_TESTS_RUN);
-                    myTestExecutionMessage = myLogFromFailedTests.substring(0, myTestsRunIndex).trim();
+                    myTestExecutionMessage = myLogFromFailedTests.substring(0, myTestsRunIndex).trim().replaceAll("\"", "'");
                   } catch (Exception e) {
                     if (Result.ABORTED.equals(myTestResult)) {
                       myTestExecutionMessage = "Test run was aborted.";
